@@ -3,11 +3,11 @@ package launcher
 import (
 	"context"
 	"fmt"
-	"github.com/pkg/errors"
-	"github.com/rs/zerolog"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"os"
 	"os/exec"
@@ -75,7 +75,7 @@ func (l *Launcher) Run(ctx context.Context, args ...string) error {
 		l.cmd.Stderr = os.Stderr
 		err := l.cmd.Start()
 		if err != nil {
-			return errors.Wrapf(err, "error starting %s", l.binPath)
+			return fmt.Errorf("error starting %s: %w", l.binPath, err)
 		}
 		err = l.cmd.Wait()
 		c := getExitCode(err)
@@ -139,7 +139,7 @@ func (l *Launcher) InterruptChild(ctx context.Context) error {
 	select {
 	case err := <-stop:
 		if err != nil {
-			return errors.Wrap(err, "error encountered during child process interrupt")
+			return fmt.Errorf("error encountered during child process interrupt: %w", err)
 		}
 		return nil
 	case <-ctx.Done():
@@ -149,7 +149,7 @@ func (l *Launcher) InterruptChild(ctx context.Context) error {
 		logger.Warn().Msg("process did not exit gracefully; issuing a kill signal")
 		err := l.doKillChild()
 		if err != nil {
-			return errors.Wrap(err, "error during child process kill")
+			return fmt.Errorf("error during child process kill: %w", err)
 		}
 	}
 	return nil
