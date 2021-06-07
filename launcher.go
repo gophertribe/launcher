@@ -2,183 +2,141 @@ package launcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sync"
 	"syscall"
 	"time"
 
-	"github.com/rs/zerolog"
+	"log"
 
 	"os"
 	"os/exec"
 	"os/signal"
 )
 
+var errNotInterrupted = errors.New("could not interrupt child process")
+
 //RuntimeError wraps error exit code from the child process
 type RuntimeError struct {
 	ExitCode int
 }
 
-func (r *RuntimeError) Error() string {
+func (r RuntimeError) Error() string {
 	return fmt.Sprintf("child process exited with non-zero exit code: %d", r.ExitCode)
 }
 
-//Opts contains launcher configuration options
-type Opts struct {
-	InterruptTimeout time.Duration
-}
-
-var defaultOpts = &Opts{
-	InterruptTimeout: 5 * time.Second,
-}
-
-type Launcher struct {
-	sync.Mutex
-	opts    *Opts
-	binPath string
-	cmd     *exec.Cmd
-	sig     os.Signal
-	quit    bool
-}
-
-func NewLauncher(binPath string) *Launcher {
-	l := &Launcher{binPath: binPath}
-	return l
-}
-
-func (l *Launcher) SetOpts(o *Opts) {
-	l.opts = o
-}
-
-func (l *Launcher) Run(ctx context.Context, args ...string) error {
-	if l.opts == nil {
-		l.opts = defaultOpts
+func ExitCode(err error) int {
+	if runtime, ok := err.(RuntimeError); ok {
+		return runtime.ExitCode
 	}
-	// extract logger if available
-	logger := zerolog.Ctx(ctx)
-	logger.UpdateContext(func(c zerolog.Context) zerolog.Context {
-		return c.Str("executable", l.binPath)
-	})
-
-	for {
-		if l.quit {
-			logger.Info().Msgf("stopping launcher process")
-			return nil
-		}
-		// run the child process
-		l.sig = nil
-
-		logger.Info().Msgf("executing command with arguments %s", args)
-		l.cmd = exec.Command(l.binPath, args...)
-		l.cmd.Stdin = os.Stdin
-		l.cmd.Stdout = os.Stdout
-		l.cmd.Stderr = os.Stderr
-		err := l.cmd.Start()
-		if err != nil {
-			return fmt.Errorf("error starting %s: %w", l.binPath, err)
-		}
-		err = l.cmd.Wait()
-		c := getExitCode(err)
-		if l.sig == nil {
-			if err != nil {
-				logger.Error().Err(err).Msgf("child process %d exited with error code %d", l.cmd.Process.Pid, c)
-			} else {
-				logger.Warn().Msgf("child process %d exited with code %d", l.cmd.Process.Pid, c)
-			}
-			return &RuntimeError{c}
-		}
-		if err != nil {
-			logger.Error().Err(err).Msgf("child process %d exited with code %d after receiving '%s' signal", l.cmd.Process.Pid, c, l.sig)
-		} else {
-			logger.Info().Msgf("child process %d exited with code %d after receiving '%s' signal", l.cmd.Process.Pid, c, l.sig)
-		}
-	}
+	return -1
 }
 
-func (l *Launcher) SignalHandler(ctx context.Context) {
-	logger := zerolog.Ctx(ctx)
-	// initialize os signal capturing logic
+func Launch(ctx context.Context, interruptSignal os.Signal, interruptTimeout time.Duration, binPath string, args ...string) error {
+	// out will receive child signal exit code
+	out := make(chan int)
+	defer close(out)
+
+	// sig receives system signals
 	sig := make(chan os.Signal)
 	signal.Notify(sig)
 	defer signal.Stop(sig)
+
+	// we loop until the launcher receives an interrupt signal
+RUN:
 	for {
-		select {
-		case s := <-sig:
-			switch s {
-			case os.Interrupt:
-				l.quit = true
-				fallthrough
-			case syscall.SIGUSR1:
-				// restarts the child
-				logger.Info().Msgf("restarting child process %d", l.cmd.Process.Pid)
-				c, cancel := context.WithTimeout(ctx, l.opts.InterruptTimeout)
-				err := l.InterruptChild(c)
-				if err != nil {
-					logger.Error().Err(err).Msgf("error interrupting the process (exit code %d)", getExitCode(err))
+		cmd := exec.Command(binPath, args...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err := cmd.Start()
+		if err != nil {
+			return fmt.Errorf("error starting %s: %w", binPath, err)
+		}
+
+		// wait for the child to terminate or for system signals to come
+		go waitForChild(cmd, out)
+
+		for {
+			select {
+			case code := <-out:
+				// child process exited itself, here this is an unexpected event
+				return fmt.Errorf("child process exited unexpectedly with exit code: %d", code)
+			case s := <-sig:
+				switch s {
+				case os.Interrupt:
+					// we simply stop the child and exit
+					return interruptChild(ctx, cmd, out, interruptSignal, interruptTimeout)
+				case syscall.SIGUSR1:
+					err := interruptChild(ctx, cmd, out, interruptSignal, interruptTimeout)
+					// if the child process could not be interrupted it's safer to exit immediately
+					if errors.Is(err, errNotInterrupted) {
+						return err
+					}
+					if runtime, ok := err.(RuntimeError); ok {
+						log.Printf("child process returned non-zero exit code (%d) during restart", runtime.ExitCode)
+					}
+					continue RUN
 				}
-				cancel()
-				return
+			case <-ctx.Done():
+				// same as simple interrupt
+				return interruptChild(ctx, cmd, out, interruptSignal, interruptTimeout)
 			}
-		case <-ctx.Done():
-			logger.Info().Msg("signal processor will quit")
-			return
 		}
 	}
 }
 
-func (l *Launcher) InterruptChild(ctx context.Context) error {
-	// locks the launcher until the signal is not issued
-	l.Lock()
-	defer l.Unlock()
-	logger := zerolog.Ctx(ctx)
-	l.sig = os.Interrupt
-	stop := make(chan error)
-	go func(ret chan error) {
-		ret <- l.cmd.Process.Signal(l.sig)
-	}(stop)
+func interruptChild(ctx context.Context, cmd *exec.Cmd, out <-chan int, signal os.Signal, timeout time.Duration) error {
+	// issue an interrupt signal and wait for the command to end
+	err := cmd.Process.Signal(signal)
+	if err != nil {
+		if cmd.ProcessState.Exited() {
+			if code := cmd.ProcessState.ExitCode(); code != 0 {
+				return RuntimeError{ExitCode: code}
+			}
+			return nil
+		}
+		return fmt.Errorf("could not send interrupt signal to child process: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	select {
-	case err := <-stop:
-		if err != nil {
-			return fmt.Errorf("error encountered during child process interrupt: %w", err)
+	case code := <-out:
+		if code != 0 {
+			return RuntimeError{ExitCode: code}
 		}
 		return nil
 	case <-ctx.Done():
-		// proceed to kill
-	}
-	if !l.cmd.ProcessState.Exited() {
-		logger.Warn().Msg("process did not exit gracefully; issuing a kill signal")
-		err := l.doKillChild()
-		if err != nil {
-			return fmt.Errorf("error during child process kill: %w", err)
+		if !cmd.ProcessState.Exited() {
+			log.Printf("child process %s did not exit gracefully; issuing a kill signal", cmd.Path)
+			err = cmd.Process.Signal(os.Kill)
+			if err != nil {
+				return fmt.Errorf("could not send kill signal to child process: %w", err)
+			}
+			// now it must exit
+			code := <-out
+			return RuntimeError{ExitCode: code}
 		}
+		// if the process has exit somehow we check its exit code
+		if code := cmd.ProcessState.ExitCode(); code != 0 {
+			return RuntimeError{ExitCode: code}
+		}
+		return nil
 	}
-	return nil
 }
 
-func (l *Launcher) KillChild() error {
-	l.Lock()
-	defer l.Unlock()
-	return l.doKillChild()
-}
-
-func (l *Launcher) doKillChild() error {
-	l.sig = os.Kill
-
-	err := l.cmd.Process.Signal(l.sig)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func getExitCode(err error) int {
+func waitForChild(cmd *exec.Cmd, out chan<- int) {
+	err := cmd.Wait()
 	if err == nil {
-		return 0
+		out <- 0
+		return
 	}
-	if exiterr, ok := err.(*exec.ExitError); ok {
-		if status, ok := exiterr.Sys().(syscall.WaitStatus); ok {
-			return status.ExitStatus()
+	if exit, ok := err.(*exec.ExitError); ok {
+		if status, ok := exit.Sys().(syscall.WaitStatus); ok {
+			out <- status.ExitStatus()
+			return
 		}
 	}
-	return 99
+	out <- 99
 }

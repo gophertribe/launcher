@@ -1,8 +1,8 @@
 module github.com/mklimuk/launcher
 
-go 1.12
+go 1.14
 
 require (
-	github.com/rs/zerolog v1.19.0
+	github.com/rs/zerolog v1.20.0
 	github.com/zenazn/goji v0.9.0 // indirect
 )
