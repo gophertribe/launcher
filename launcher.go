@@ -4,19 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"syscall"
-	"time"
-
 	"log"
-
 	"os"
 	"os/exec"
 	"os/signal"
+	"syscall"
+	"time"
 )
 
 var errNotInterrupted = errors.New("could not interrupt child process")
 
-//RuntimeError wraps error exit code from the child process
+// RuntimeError wraps error exit code from the child process
 type RuntimeError struct {
 	ExitCode int
 }
@@ -26,10 +24,11 @@ func (r RuntimeError) Error() string {
 }
 
 func ExitCode(err error) int {
-	if runtime, ok := err.(RuntimeError); ok {
+	var runtime RuntimeError
+	if errors.As(err, &runtime) {
 		return runtime.ExitCode
 	}
-	return -1
+	return 1
 }
 
 func Launch(ctx context.Context, interruptSignal os.Signal, interruptTimeout time.Duration, binPath string, args ...string) error {
@@ -38,7 +37,7 @@ func Launch(ctx context.Context, interruptSignal os.Signal, interruptTimeout tim
 	defer close(out)
 
 	// sig receives system signals
-	sig := make(chan os.Signal)
+	sig := make(chan os.Signal, 1)
 	signal.Notify(sig)
 	defer signal.Stop(sig)
 
@@ -73,7 +72,8 @@ RUN:
 					if errors.Is(err, errNotInterrupted) {
 						return err
 					}
-					if runtime, ok := err.(RuntimeError); ok {
+					var runtime RuntimeError
+					if errors.As(err, &runtime) {
 						log.Printf("child process returned non-zero exit code (%d) during restart", runtime.ExitCode)
 					}
 					continue RUN
@@ -132,11 +132,12 @@ func waitForChild(cmd *exec.Cmd, out chan<- int) {
 		out <- 0
 		return
 	}
-	if exit, ok := err.(*exec.ExitError); ok {
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
 		if status, ok := exit.Sys().(syscall.WaitStatus); ok {
 			out <- status.ExitStatus()
 			return
 		}
 	}
-	out <- 99
+	out <- 1
 }
