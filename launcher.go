@@ -110,7 +110,7 @@ func interruptChild(ctx context.Context, cmd *exec.Cmd, out <-chan int, signal o
 	case <-ctx.Done():
 		if !cmd.ProcessState.Exited() {
 			log.Printf("child process %s did not exit gracefully; issuing a kill signal", cmd.Path)
-			err = cmd.Process.Signal(os.Kill)
+			err = cmd.Process.Signal(syscall.SIGTERM)
 			if err != nil {
 				return fmt.Errorf("could not send kill signal to child process: %w", err)
 			}
@@ -122,7 +122,7 @@ func interruptChild(ctx context.Context, cmd *exec.Cmd, out <-chan int, signal o
 		if code := cmd.ProcessState.ExitCode(); code != 0 {
 			return RuntimeError{ExitCode: code}
 		}
-		return nil
+		return ctx.Err()
 	}
 }
 
