@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -31,7 +33,52 @@ func ExitCode(err error) int {
 	return 1
 }
 
-func Launch(ctx context.Context, interruptSignal os.Signal, interruptTimeout time.Duration, binPath string, args ...string) error {
+type Opt func(*Opts)
+
+func WithInterruptSignal(signal os.Signal) Opt {
+	return func(o *Opts) {
+		o.InterruptSignal = signal
+	}
+}
+
+func WithInterruptTimeout(timeout time.Duration) Opt {
+	return func(o *Opts) {
+		o.InterruptTimeout = timeout
+	}
+}
+
+func WithWaitGroup(wg *sync.WaitGroup) Opt {
+	return func(o *Opts) {
+		o.WaitGroup = wg
+	}
+}
+
+type Opts struct {
+	InterruptSignal  os.Signal
+	InterruptTimeout time.Duration
+	WaitGroup        *sync.WaitGroup
+}
+
+type Launcher struct {
+	child *exec.Cmd
+	opts  Opts
+}
+
+func New(opt ...Opt) *Launcher {
+	launcher := &Launcher{
+		opts: Opts{
+			InterruptSignal:  os.Interrupt,
+			InterruptTimeout: 10 * time.Second,
+			WaitGroup:        &sync.WaitGroup{},
+		},
+	}
+	for _, o := range opt {
+		o(&launcher.opts)
+	}
+	return launcher
+}
+
+func (launcher *Launcher) Launch(ctx context.Context, binPath string, args ...string) error {
 	// out will receive child signal exit code
 	out := make(chan int)
 	defer close(out)
@@ -44,17 +91,18 @@ func Launch(ctx context.Context, interruptSignal os.Signal, interruptTimeout tim
 	// we loop until the launcher receives an interrupt signal
 RUN:
 	for {
-		cmd := exec.Command(binPath, args...)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err := cmd.Start()
+		launcher.child = exec.CommandContext(ctx, binPath, args...)
+		launcher.child.Stdin = os.Stdin
+		launcher.child.Stdout = os.Stdout
+		launcher.child.Stderr = os.Stderr
+		err := launcher.child.Start()
 		if err != nil {
 			return fmt.Errorf("error starting %s: %w", binPath, err)
 		}
+		slog.Info("started child process", "cmd", binPath, "args", args, "pid", launcher.child.Process.Pid)
 
 		// wait for the child to terminate or for system signals to come
-		go waitForChild(cmd, out)
+		launcher.waitForChild(out)
 
 		for {
 			select {
@@ -63,11 +111,13 @@ RUN:
 				return fmt.Errorf("child process exited unexpectedly with exit code: %d", code)
 			case s := <-sig:
 				switch s {
-				case os.Interrupt:
+				case os.Interrupt, os.Kill, syscall.SIGTERM, syscall.SIGQUIT:
+					slog.Info("signal received; interrupting child process", "signal", s)
 					// we simply stop the child and exit
-					return interruptChild(ctx, cmd, out, interruptSignal, interruptTimeout)
+					return launcher.interruptChild(ctx, out)
 				case syscall.SIGUSR1:
-					err := interruptChild(ctx, cmd, out, interruptSignal, interruptTimeout)
+					slog.Info("signal received; restarting child process", "signal", s)
+					err := launcher.interruptChild(ctx, out)
 					// if the child process could not be interrupted it's safer to exit immediately
 					if errors.Is(err, errNotInterrupted) {
 						return err
@@ -80,25 +130,25 @@ RUN:
 				}
 			case <-ctx.Done():
 				// same as simple interrupt
-				return interruptChild(ctx, cmd, out, interruptSignal, interruptTimeout)
+				return launcher.interruptChild(ctx, out)
 			}
 		}
 	}
 }
 
-func interruptChild(ctx context.Context, cmd *exec.Cmd, out <-chan int, signal os.Signal, timeout time.Duration) error {
+func (launcher *Launcher) interruptChild(ctx context.Context, out <-chan int) error {
 	// issue an interrupt signal and wait for the command to end
-	err := cmd.Process.Signal(signal)
+	err := launcher.child.Process.Signal(launcher.opts.InterruptSignal)
 	if err != nil {
-		if cmd.ProcessState.Exited() {
-			if code := cmd.ProcessState.ExitCode(); code != 0 {
+		if launcher.child.ProcessState.Exited() {
+			if code := launcher.child.ProcessState.ExitCode(); code != 0 {
 				return RuntimeError{ExitCode: code}
 			}
 			return nil
 		}
-		return fmt.Errorf("could not send interrupt signal to child process: %w", err)
+		return fmt.Errorf("%w: could not send interrupt signal to child process: %v", errNotInterrupted, err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, launcher.opts.InterruptTimeout)
 	defer cancel()
 
 	select {
@@ -108,36 +158,43 @@ func interruptChild(ctx context.Context, cmd *exec.Cmd, out <-chan int, signal o
 		}
 		return nil
 	case <-ctx.Done():
-		if !cmd.ProcessState.Exited() {
-			log.Printf("child process %s did not exit gracefully; issuing a kill signal", cmd.Path)
-			err = cmd.Process.Signal(syscall.SIGTERM)
+		if launcher.child.ProcessState == nil {
+			return ctx.Err()
+		}
+		if !launcher.child.ProcessState.Exited() {
+			slog.Info("child process did not exit gracefully; issuing a kill signal", "cmd", launcher.child.Path, "pid", launcher.child.Process.Pid)
+			err = launcher.child.Process.Signal(syscall.SIGTERM)
 			if err != nil {
-				return fmt.Errorf("could not send kill signal to child process: %w", err)
+				return fmt.Errorf("%w: could not send kill signal to child process: %v", errNotInterrupted, err)
 			}
 			// now it must exit
 			code := <-out
 			return RuntimeError{ExitCode: code}
 		}
 		// if the process has exit somehow we check its exit code
-		if code := cmd.ProcessState.ExitCode(); code != 0 {
+		if code := launcher.child.ProcessState.ExitCode(); code != 0 {
 			return RuntimeError{ExitCode: code}
 		}
 		return ctx.Err()
 	}
 }
 
-func waitForChild(cmd *exec.Cmd, out chan<- int) {
-	err := cmd.Wait()
-	if err == nil {
-		out <- 0
-		return
-	}
-	var exit *exec.ExitError
-	if errors.As(err, &exit) {
-		if status, ok := exit.Sys().(syscall.WaitStatus); ok {
-			out <- status.ExitStatus()
+func (launcher *Launcher) waitForChild(out chan<- int) {
+	launcher.opts.WaitGroup.Add(1)
+	go func() {
+		defer launcher.opts.WaitGroup.Done()
+		err := launcher.child.Wait()
+		if err == nil {
+			out <- 0
 			return
 		}
-	}
-	out <- 1
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			if status, ok := exit.Sys().(syscall.WaitStatus); ok {
+				out <- status.ExitStatus()
+				return
+			}
+		}
+		out <- 1
+	}()
 }
