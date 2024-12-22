@@ -45,13 +45,13 @@ func executeStage(globalCtx context.Context, current ExecutionStage) (ExecutionS
 	defer func() {
 		if err := recover(); err != nil {
 			slog.Error("panic during stage execution", "stage", current.Name(), "err", err)
-			fmt.Println(debug.Stack())
+			fmt.Println(string(debug.Stack()))
 		}
 		// recover also from potential panics during shutdown
 		defer func() {
 			if err := recover(); err != nil {
 				slog.Error("panic during shutdown", "stage", current.Name(), "err", err)
-				fmt.Println(debug.Stack())
+				fmt.Println(string(debug.Stack()))
 			}
 		}()
 		// we attempt the shutdown
