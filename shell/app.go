@@ -37,31 +37,19 @@ func Execute(globalCtx context.Context, current ExecutionStage) error {
 }
 
 func executeStage(globalCtx context.Context, current ExecutionStage) (ExecutionStage, error) {
-	// we assign a separate context for each stage
-	ctx, cancel := context.WithCancel(globalCtx)
-	defer cancel()
-
-	now := time.Now()
 	defer func() {
 		if err := recover(); err != nil {
 			slog.Error("panic during stage execution", "stage", current.Name(), "err", err)
 			fmt.Println(string(debug.Stack()))
 		}
-		// recover also from potential panics during shutdown
-		defer func() {
-			if err := recover(); err != nil {
-				slog.Error("panic during shutdown", "stage", current.Name(), "err", err)
-				fmt.Println(string(debug.Stack()))
-			}
-		}()
-		// we attempt the shutdown
-		shutdownErr := current.Shutdown(context.WithTimeout(context.Background(), current.ShutdownTimeout()))
-		if shutdownErr != nil {
-			slog.Error("error during shutdown", "stage", current.Name(), "err", shutdownErr)
-			return
-		}
-		slog.Info("shutdown completed", "stage", current.Name(), "uptime", time.Since(now))
 	}()
+
+	// we assign a separate context for each stage
+	ctx, cancel := context.WithCancel(globalCtx)
+	defer cancel()
+
+	now := time.Now()
+	defer shutdown(current, now)
 
 	// we initialize a separate cancelable context for each stage
 	ctx, err := current.Configure(ctx, cancel)
@@ -77,4 +65,21 @@ func executeStage(globalCtx context.Context, current ExecutionStage) (ExecutionS
 	}
 	slog.Info("runtime exit", "stage", current.Name(), "uptime", time.Since(now))
 	return next, nil
+}
+
+func shutdown(current ExecutionStage, now time.Time) {
+	// recover also from potential panics during shutdown
+	defer func() {
+		if err := recover(); err != nil {
+			slog.Error("panic during shutdown", "stage", current.Name(), "err", err)
+			fmt.Println(string(debug.Stack()))
+		}
+	}()
+	// we attempt the shutdown
+	shutdownErr := current.Shutdown(context.WithTimeout(context.Background(), current.ShutdownTimeout()))
+	if shutdownErr != nil {
+		slog.Error("error during shutdown", "stage", current.Name(), "err", shutdownErr)
+		return
+	}
+	slog.Info("shutdown completed", "stage", current.Name(), "uptime", time.Since(now))
 }
