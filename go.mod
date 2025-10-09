@@ -1,5 +1,3 @@
-module github.com/mklimuk/launcher
+module github.com/gophertribe/launcher
 
-go 1.14
-
-require github.com/rs/zerolog v1.20.0
+go 1.23
