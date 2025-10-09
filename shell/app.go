@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+type Logger interface {
+	slog.Handler
+	SetLevel(string) error
+}
+
 type ExecutionStage interface {
 	Name() string
 	Configure(ctx context.Context, cancel context.CancelFunc) (context.Context, error)
