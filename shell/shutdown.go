@@ -3,12 +3,20 @@ package shell
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"runtime/pprof"
 )
 
 func Shutdown(ctx context.Context, cancel context.CancelFunc, shutdown func(cancelFunc context.CancelFunc)) error {
+	defer func() {
+		if err := recover(); err != nil {
+			slog.Error("panic during shutdown callback execution", "err", err)
+			fmt.Println(string(debug.Stack()))
+		}
+	}()
 	// when shutdown ends, it will cancel the context
 	go shutdown(cancel)
 
