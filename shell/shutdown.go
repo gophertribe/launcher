@@ -11,14 +11,16 @@ import (
 )
 
 func Shutdown(ctx context.Context, cancel context.CancelFunc, shutdown func(cancelFunc context.CancelFunc)) error {
-	defer func() {
-		if err := recover(); err != nil {
-			slog.Error("panic during shutdown callback execution", "err", err)
-			fmt.Println(string(debug.Stack()))
-		}
-	}()
 	// when shutdown ends, it will cancel the context
-	go shutdown(cancel)
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				slog.Error("panic during shutdown callback execution", "err", err)
+				fmt.Println(string(debug.Stack()))
+			}
+		}()
+		shutdown(cancel)
+	}()
 
 	// this context will cancel either when the shutdown procedure is over or when the timeout expires
 	<-ctx.Done()
